@@ -1043,8 +1043,11 @@ def compiled_module_main(benchmark_name, benchmark_compiled_module_fn):
     if args.benchmark_kernels:
         benchmark_all_kernels(benchmark_name, args.benchmark_all_configs)
     else:
-        times = 10
-        repeat = 10
+        # previously we set times and repeat to 10. This case the compiled module
+        # being run 100 times. The chrome trace will be too large. We don't really
+        # need run 100 times, 9 times should be good enough.
+        times = 3
+        repeat = 3
         wall_time_ms = (
             benchmark_compiled_module_fn(times=times, repeat=repeat) / times * 1000
         )
@@ -1075,3 +1078,33 @@ def triton_config_to_hashable(cfg):
     items.append(("num_warps", cfg.num_warps))
     items.append(("num_stages", cfg.num_stages))
     return tuple(items)
+
+
+HAS_COLORAMA = True
+try:
+    import colorama
+except ImportError:
+    HAS_COLORAMA = False
+
+
+def _color_text(msg, color):
+    if not HAS_COLORAMA:
+        return msg
+
+    return getattr(colorama.Fore, color.upper()) + msg + colorama.Fore.RESET
+
+
+def green_text(msg):
+    return _color_text(msg, "green")
+
+
+def yellow_text(msg):
+    return _color_text(msg, "yellow")
+
+
+def red_text(msg):
+    return _color_text(msg, "red")
+
+
+def blue_text(msg):
+    return _color_text(msg, "blue")

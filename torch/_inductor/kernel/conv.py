@@ -1,4 +1,5 @@
 import functools
+import logging
 from typing import List
 
 import torch
@@ -26,6 +27,9 @@ from ..utils import (
 )
 from ..virtualized import V
 from .mm_common import filtered_configs
+
+log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)  # TODO remove before merging
 
 
 aten = torch.ops.aten
@@ -335,10 +339,22 @@ def convolution(
 
     x.realize()
     weight.realize()
-    layout = conv_layout(x, weight, None, **kwargs)
-    req_stride_order = ir.get_stride_order(V.graph.sizevars.size_hints(layout.stride))
-    x = ir.ExternKernel.require_stride_order(x, req_stride_order)
-    weight = ir.ExternKernel.require_stride_order(weight, req_stride_order)
+
+    # ndim can be 1 for convolution in models such as demucs
+    if config.layout_opt and ndim == 2:
+        log.debug("FORCE CHANNELS LAST INPUTS FOR CONV")
+        x = ir.ExternKernel.require_channels_last(x)
+        # TODO maybe we can convert weights to channels last just once before
+        # running the model.
+        weight = ir.ExternKernel.require_channels_last(weight)
+        layout = conv_layout(x, weight, None, **kwargs)
+    else:
+        layout = conv_layout(x, weight, None, **kwargs)
+        req_stride_order = ir.get_stride_order(
+            V.graph.sizevars.size_hints(layout.stride)
+        )
+        x = ir.ExternKernel.require_stride_order(x, req_stride_order)
+        weight = ir.ExternKernel.require_stride_order(weight, req_stride_order)
 
     if bias is None:
         args = (x, weight)
@@ -417,4 +433,5 @@ def _convolution(
     )
 
 
-add_layout_constraint(aten.convolution, constrain_to_fx_strides)
+if not config.layout_opt:
+    add_layout_constraint(aten.convolution, constrain_to_fx_strides)

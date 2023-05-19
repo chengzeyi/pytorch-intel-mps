@@ -22,7 +22,7 @@ dce = False
 static_weight_shapes = True
 
 # put correctness assertions in generated code
-size_asserts = True
+size_asserts = os.environ.get("TORCHINDUCTOR_SIZE_ASSERTS", "1") == "1"
 
 # enable loop reordering based on input orders
 pick_loop_orders = True
@@ -66,10 +66,12 @@ search_autotune_cache = os.environ.get("TORCHINDUCTOR_SEARCH_AUTOTUNE_CACHE") ==
 # We will disable creating subprocess for autotuning if this is False
 autotune_in_subproc = os.environ.get("TORCHINDUCTOR_AUTOTUNE_IN_SUBPROC") == "1"
 
-
 coordinate_descent_tuning = (
     os.environ.get("TORCHINDUCTOR_COORDINATE_DESCENT_TUNING") == "1"
 )
+
+layout_opt = os.environ.get("TORCHINDUCTOR_LAYOUT_OPT", "1") == "1"
+warn_mix_layout = os.environ.get("TORCHINDUCTOR_WARN_MIX_LAYOUT") == "1"
 
 # control store vs recompute heuristic
 # For fanouts, rematerialization can lead to exponential blowup. So, have
@@ -230,7 +232,9 @@ class triton:
     cudagraphs = False
 
     # Use cudagraph trees for memory pooling if `cudagraphs` is True
-    cudagraph_trees = not is_fbcode()
+    # cudagraph_trees = not is_fbcode()
+    # TODO: I'll revert the change here
+    cudagraph_trees = os.environ.get("TORCHINDUCTOR_CUDAGRAPH_TREES", "1") == "1"
 
     # assertions not on the fast path, steady state
     slow_path_cudagraph_asserts = True

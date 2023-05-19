@@ -146,6 +146,8 @@ class GraphLowering(torch.fx.Interpreter):
         aot_mode=False,
     ):
         super().__init__(gm)
+
+        self.decide_layout_opt()
         self.extra_traceback = False  # we do our own error wrapping
         if shape_env is None:
             shape_env = ShapeEnv()
@@ -178,7 +180,153 @@ class GraphLowering(torch.fx.Interpreter):
         self.aot_mode = aot_mode
         self.graph_id = graph_id
         self.scheduler = None
+        self.nodes_prefer_channels_last = (
+            self.find_nodes_prefer_channels_last() if config.layout_opt else set()
+        )
         self._warned_fallback = {"aten.convolution_backward"}
+
+    def decide_layout_opt(self):
+        if not config.layout_opt:
+            return
+
+        gm = self.module
+        conv_nodes = [
+            n for n in gm.graph.nodes if n.target == torch.ops.aten.convolution.default
+        ]
+        nconv = len(conv_nodes)
+
+        if nconv == 0:
+            return
+
+        # Followering models are skipped due to this:
+        # jx_nest_base
+        # volo_d1_224
+        if len(list(gm.graph.nodes)) >= 300 * nconv:
+            log.debug("ONLY A FEW CONV, SKIP LAYOUT OPT")
+            config.layout_opt = False
+            return
+
+        # Channels last layout can dramatically hurt grouped conv perf. E.g.
+        # Conv with arguments like
+        #   {"input_shape": [32, 224, 112, 112], "weight_shape": [224, 112, 3, 3],
+        #    "stride": [2, 2], "padding": [1, 1], "groups": 2}
+        # slows down 31x using channels last..
+
+        # But a lot of timm models use depthwise separable convolution which will
+        # result in grouped convolution with in-channel size == 1.
+        # For those grouped convolution, channels last still helps a lot.
+        # E.g.
+        # Conv with arguments
+        #   {"input_shape": [128, 58, 56, 56], "weight_shape": [58, 1, 3, 3],
+        #    "stride": [2, 2], "padding": [1, 1], "groups": 58}
+        # get 1.86x speedup with channels last layout.
+        #
+        # The following heuristics skip using channels-last if the model contains
+        # grouped convolution with in-channels > 1.
+        if any(
+            n.args[-1] > 1 and n.args[1].meta["val"].size(1) > 1 for n in conv_nodes
+        ):
+            log.debug("FOUND GROUPED CONVOLUTION with >1 in_channels!")
+            config.layout_opt = False
+            return
+
+        # For some models that contain convolution with larger in-channel than out-channel, applying
+        # channels last hurts performance.
+        # Following models are skipped due to this:
+        # - pytorch_unet
+        # - phlippe_densenet (slightly worse)
+        # - Background_Matting (1.22x -> 0.821x)
+        # - pytorch_CycleGAN_and_pix2pix (1.597x -> 1.294x)
+        if any(
+            n.args[1].meta["val"].size(0) * 2 <= n.args[1].meta["val"].size(1)
+            and n.args[1].meta["val"].size(2) > 1
+            for n in conv_nodes
+        ):
+            log.debug(
+                "SKIP LAYOUT OPT BECAUSE SOME CONVOLUTTION HAS SMALLER OUT_CHANNEL"
+            )
+            config.layout_opt = False
+            return
+
+        # Following models are skipped due to this:
+        # - functorch_maml_omniglot
+        if all(
+            n.args[1].meta["val"].size(0) <= 64 and n.args[1].meta["val"].size(1) <= 64
+            for n in conv_nodes
+        ):
+            log.debug("SKIP LAYOUT OPT BECAUSE ALL CONVOLUTION CHANNELS TOO SMALL")
+            config.layout_opt = False
+            return
+
+        # aten._scaled_dot_product_flash_attention requires the last stride of query/key/value
+        # to be 1. Check https://gist.github.com/shunting314/fa6eeab2aad8d1265c4d5e50b560d94f
+        # for more details.
+        #
+        # When a model contains aten._scaled_dot_product_flash_attention and we enable layout optimization,
+        # the op may get channels last input and fail. Example include: twins_pcpvt_base, xcit_large_24_p8_224
+        #
+        # We disable layout optimization if a model contains aten._scaled_dot_product_flash_attention.
+        #
+        # An alternative is to do necessary layout convertion to make sure aten._scaled_dot_product_flash_attention's
+        # inputs have the layout needed. But that seems to have worse perf than disabing the layout opt.
+        for n in gm.graph.nodes:
+            if n.target == torch.ops.aten._scaled_dot_product_flash_attention.default:
+                log.debug(
+                    "SKIP LAYOUT OPT BECAUSE _scaled_dot_product_flash_attention found"
+                )
+                config.layout_opt = False
+                return
+
+    def find_nodes_prefer_channels_last(self):
+        """
+        The rule to decide if an node prefer channels last is simple.
+        1. if it's input/output of a convolution
+        2. if one of its user preferes channels last
+
+        We have rule 1 because cudnn runs a faster convolution kernel for channels last inputs;
+        Rule 2 is also important. It makes sure that indirect inputs to convolution also prefers
+        channels last.
+
+        Consider the scenario: conv -> batch-norm -> relu -> conv
+        Without rule 2, batch-norm output may use a congituous layout. That will cause 2 extra copies:
+        1. the output of batch-norm should be channels last initially since its input is a conv's output.
+           Forcing the batch-norm's output to be contiguous results in the first copy
+        2. The second conv's input is initially contiguous. This layout is propagated from the batch-norm's output.
+           We need convert it to channels last layout which results in the second copy.
+        With rule 2, we makes sure all the tensors in the chain uses channels last layout. So both copies
+        can be saved.
+        """
+        output_set = set()
+        for n in reversed(self.module.graph.nodes):
+            if n.target == torch.ops.aten.convolution.default:
+                output_set.add(n)
+                continue
+
+            for user in n.users:
+                if user in output_set:
+                    output_set.add(n)
+                    break
+
+        # need a second pass to add downstream nodes of those channel last nodes to the sets.
+        # This pass is especially needed to avoid mix-layout kernel inputs in backward pass.
+        #
+        # Let's say a conv-batchnorm 's output is passed to relu whose output is in turn returned
+        # from the fwd graph. Without this second pass, we will force relu's output to be contiguous.
+        # Then in the kernel in backward pass, the contiguous output of relu may be mix with other channels last
+        # tensors and passed to a kernel.
+        #
+        # This pass improve yolov3 training speedup from 1.116x (worse than disabling layout optimization speedup 1.196x) to 1.457x.
+        # It also improves dla102 training speedup from 1.240x (worse than disabling layout optimization speedup 1.523x) to 1.835x .
+        # This also helps the following models:
+        # - res2net101_26w_4s
+        # - res2net50_14w_8s
+        # - sebotnet33ts_256
+        for n in self.module.graph.nodes:
+            if n in output_set:
+                for child in n.users:
+                    output_set.add(child)
+
+        return output_set
 
     def warn_fallback(self, name):
         if name not in self._warned_fallback:
@@ -529,9 +677,15 @@ class GraphLowering(torch.fx.Interpreter):
                 # requiring a stride order for a non-dense output wouldn't
                 # recreate the same strides, and would fail with view, defer for now.
                 if dense and len(strides):
-                    result = ir.ExternKernel.require_stride_order(
-                        result, ir.get_stride_order(strides)
-                    )
+                    stride_order = ir.get_stride_order(strides)
+
+                    if (
+                        len(result.get_size()) == 4
+                        and n in self.nodes_prefer_channels_last
+                    ):
+                        stride_order = ir.NHWC_STRIDE_ORDER
+
+                    result = ir.ExternKernel.require_stride_order(result, stride_order)
 
             # Realize if (1) any user need inputs realized, or (2) there is
             # already too many reads and rematerializing can be bad.
@@ -551,11 +705,12 @@ class GraphLowering(torch.fx.Interpreter):
                         # When we do a better job selecting layout, we should
                         # revisit this.
                         need_fixed_layout = [
-                            torch.ops.aten.convolution.default,
                             torch.ops.aten.convolution_backward.default,
                             torch.ops.aten.mm.default,
                             torch.ops.aten._int_mm.default,
                         ]
+                        if not config.layout_opt:
+                            need_fixed_layout.append(torch.ops.aten.convolution.default)
                         if torch._C.has_mkldnn:
                             need_fixed_layout += [
                                 torch.ops.mkldnn._convolution_pointwise.default,
@@ -724,7 +879,8 @@ class GraphLowering(torch.fx.Interpreter):
         output_code_log.info("Output code written to: %s", mod.__file__)
         log.debug("Output code written to: %s", mod.__file__)
         output_code_log.debug("Output code: \n%s", code)
-        if config.benchmark_kernel:
+        # TODO: will revert this line before merge
+        if config.benchmark_kernel or True:
             print(f"Compiled module path: {mod.__file__}", file=sys.stderr)
         V.debug.output_code(mod.__file__)
         V.debug.rename(os.path.splitext(mod.__file__)[0] + ".debug")
