@@ -25,6 +25,7 @@ from ..scheduler import SchedulerNode
 from ..utils import (
     cache_on_self,
     get_fused_kernel_name,
+    sympy_dot,
     sympy_product,
     sympy_subs,
     sympy_symbol,
@@ -95,6 +96,14 @@ PYTHON_TO_CPP = {
     "float": "double",
     "bool": "bool",
 }
+
+
+def ranges_tuple(node: SchedulerNode):
+    iter_ranges, reduction_ranges = node.get_ranges()
+    return (
+        tuple(iter_ranges),
+        tuple(reduction_ranges),
+    )
 
 
 def reduction_init(reduction_type, dtype):
@@ -1061,10 +1070,18 @@ class CppKernel(Kernel):
                 argmax_argmin_prefix(reduction_type, src_dtype, tmpvar)
             )
             compare_op = "<" if reduction_type == "argmax" else ">"
+            value_index = cexpr(
+                sympy_dot(
+                    self.itervars[self.reduction_depth :],
+                    ir.FlexibleLayout.contiguous_strides(
+                        self.ranges[self.reduction_depth :]
+                    ),
+                )
+            )
             self.stores.writelines(
                 [
                     f"if ({tmpvar}.value {compare_op} {value}) {{",
-                    f"    {tmpvar}.index = {self.itervars[-1]}; {tmpvar}.value = {value};",
+                    f"    {tmpvar}.index = {value_index}; {tmpvar}.value = {value};",
                     "}",
                 ],
             )
@@ -2269,11 +2286,11 @@ class CppKernelProxy(CppKernel):
         self.data_type_propagation(nodes)
 
         kernel_group = self.kernel_group
-        _, (group, reduction_group) = max(
-            nodes, key=lambda x: int(x.is_reduction())
-        ).group
+        iter_ranges, reduction_ranges = ranges_tuple(
+            max(nodes, key=lambda x: int(x.is_reduction()))
+        )
 
-        self.set_ranges(group, reduction_group)
+        self.set_ranges(iter_ranges, reduction_ranges)
 
         def codegen_kernel(cls, *args):
             with kernel_group.new_kernel(cls, *args) as kernel:
@@ -2286,21 +2303,21 @@ class CppKernelProxy(CppKernel):
                 return kernel
 
         def run(kernel):
-            vars, reduction_vars = kernel.set_ranges(group, reduction_group)
+            vars, reduction_vars = kernel.set_ranges(iter_ranges, reduction_ranges)
             in_suffix = False
             for node in nodes:
-                if node.group[1] in [
-                    (group, reduction_group),
-                    (group + reduction_group, ()),
+                if ranges_tuple(node) in [
+                    (iter_ranges, reduction_ranges),
+                    (iter_ranges + reduction_ranges, ()),
                 ]:
                     assert not in_suffix
                     node.run(vars, reduction_vars)
                 else:
                     in_suffix = True
-                    assert node.group[1] == (
-                        group,
+                    assert ranges_tuple(node) == (
+                        iter_ranges,
                         (),
-                    ), f"unexpected group: {node.group[1]} != {group}, {reduction_group}"
+                    ), f"unexpected ranges: {ranges_tuple(node)} != {iter_ranges}, {reduction_ranges}"
                     # we can fuse in some extra pointwise into the suffix
                     with kernel.write_to_suffix():
                         node.run(vars, ())
@@ -2425,7 +2442,11 @@ class CppScheduling:
         self.get_kernel_group()
 
     def group_fn(self, sizes):
-        return tuple(tuple(map(V.graph.sizevars.simplify, s)) for s in sizes)
+        iter_sizes, reduction_sizes = sizes
+        return (
+            V.graph.sizevars.simplify(sympy_product(iter_sizes)),
+            V.graph.sizevars.simplify(sympy_product(reduction_sizes)),
+        )
 
     def get_kernel_group(self):
         from .wrapper import CppWrapperCodeGen
@@ -2441,7 +2462,7 @@ class CppScheduling:
         _, (vars2, reduce2) = node2.group
         if vars1 == vars2 and reduce1 == reduce2:
             return True
-        if reduce1 == () and vars1 == vars2 + reduce2:
+        if reduce1 == 1 and vars1 == vars2 * reduce2:
             return True
         # TODO(jansel): allow fusion pointwise (vars1, ()) suffix?
         return False
@@ -2449,6 +2470,17 @@ class CppScheduling:
     @classmethod
     def can_fuse_vertical(cls, node1, node2):
         return cls.can_fuse_horizontal(node1, node2) and not node1.is_reduction()
+
+    def is_loop_order_valid(self, nodes):
+        vars2, reduce2 = ranges_tuple(max(nodes, key=lambda n: n.is_reduction()))
+        for node in nodes:
+            vars1, reduce1 = ranges_tuple(node)
+            if not (
+                (vars1 == vars2 and reduce1 == reduce2)
+                or (reduce1 == () and vars1 == vars2 + reduce2)
+            ):
+                return False
+        return True
 
     def codegen_nodes(self, nodes):
         """

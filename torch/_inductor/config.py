@@ -24,8 +24,11 @@ static_weight_shapes = True
 # put correctness assertions in generated code
 size_asserts = True
 
-# enable loop reordering based on input orders
-pick_loop_orders = True
+# maximum number of candidate loop orderings to explore, 1 to disable
+loop_ordering_search_limit = 24
+
+# break up loops ranges to allow more fusion
+split_var_ranges = True
 
 # generate inplace computations
 inplace_buffers = True

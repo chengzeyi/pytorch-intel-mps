@@ -1483,7 +1483,7 @@ class CPUReproTests(TestCase):
         metrics.reset()
         x = torch.randn(1, 384, 20, 20).to(memory_format=torch.channels_last)
         self.common(fn, (x,))
-        assert metrics.generated_cpp_vec_kernel_count == 1
+        assert metrics.generated_cpp_vec_kernel_count == 2
 
     def test_non_contiguous_index_with_constant_stride(self):
         def fn(x):

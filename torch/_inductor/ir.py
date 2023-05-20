@@ -43,7 +43,6 @@ from torch._prims_common import (
 from torch.fx.experimental.symbolic_shapes import FloorDiv
 
 from . import config, dependencies
-from .codegen.common import index_prevent_reordering
 from .cuda_properties import get_device_properties
 from .dependencies import extract_read_writes, var_builder
 from .utils import (
@@ -241,6 +240,25 @@ class ModularIndexing(sympy.Function):
 
         if isinstance(base, FloorDiv):
             return ModularIndexing(base.args[0], base.args[1] * divisor, modulus)
+
+
+def match_modular_indexing(term, v):
+    scale = sympy.Wild("scale")
+    divisor = sympy.Wild("divisor")
+    modulus = sympy.Wild("modulus")
+    if term.has(ModularIndexing):
+        m = term.match(scale * ModularIndexing(v, divisor, modulus))
+        if m and not m[scale].has(v) and not m[divisor].has(v):
+            return m[scale], m[divisor], m[modulus]
+    if term.has(CleanDiv):
+        m = term.match(scale * CleanDiv(v, divisor))
+        if m and not m[scale].has(v) and not m[divisor].has(v):
+            return m[scale], m[divisor], None
+    if term.has(FloorDiv):
+        m = term.match(scale * FloorDiv(v, divisor))
+        if m and not m[scale].has(v) and not m[divisor].has(v):
+            return m[scale], m[divisor], None
+    return None, None, None
 
 
 class CleanDiv(FloorDiv):
@@ -2207,12 +2225,6 @@ class ComputedBuffer(Buffer):
                 self.data.get_size(), self.data.get_reduction_size()
             )
             reads = self.get_read_writes().reads
-            reads_bufs = [
-                V.graph.name_to_buffer[r.name]
-                if r.name in V.graph.name_to_buffer.keys()
-                else None
-                for r in reads
-            ]
             # only consider reads to buffer of same size
             reads = [
                 sympy_subs(
@@ -2239,140 +2251,33 @@ class ComputedBuffer(Buffer):
             else:
                 self.freeze_layout()
 
-    def simplify_and_reorder(self):
+    def get_sizes_and_body(self):
         """
-        This is a main place where we do loop transformations in a
-        backend-agnostic way.
-
-        Here we:
-            1) Remove any 1 dimensions
-            2) Fuse contiguous dimensions together
-            3) Reorder dimensions based on stride orders
+        Construct the normalized LoopBody to pass to the scheduler.
         """
         args, var_ranges = dependencies.index_vars_squeeze(
             self.data.get_size(), self.data.get_reduction_size(), prefix="q"
         )
+
         with patch.object(ConstantBuffer, "override_device", self.get_device()):
             body = LoopBody(
                 self.get_store_function(),
                 (args if self.get_reduction_type() else args[:1]),
                 var_ranges,
             )
-        index_formulas = [*body.indexing_exprs.values()]
-        reads_bufs = [
-            V.graph.name_to_buffer[reads_name]
-            if reads_name in V.graph.name_to_buffer.keys()
-            else None
-            for reads_name in body.reads_name2expr.keys()
-        ]
-        memory_addrs = [
-            *body.reads_name2expr.values(),
-            *body.writes_name2expr.values(),
-        ]
-        index_vars = []
-        reduce_vars: List[Any] = []
-        index_size = []
-        reduce_size = []
-        for v, s in var_ranges.items():
-            if v in args[0]:
-                assert not reduce_vars
-                index_vars.append(v)
-                index_size.append(s)
-            else:
-                assert v in args[1]
-                reduce_vars.append(v)
-                reduce_size.append(s)
 
-        # the reordering_reindex in reads' simplify_reorder_and_tile
-        reordering_reindex = [same_reorder(range(len(index_vars)))] * len(memory_addrs)
-        for i, reads_buf in enumerate(reads_bufs):
-            if isinstance(reads_buf, ComputedBuffer) and hasattr(
-                reads_buf, "iter_reordering_reindex"
-            ):
-                reordering_reindex[i] = reads_buf.iter_reordering_reindex  # type: ignore[has-type]
+        iter_sizes = [var_ranges[v] for v in args[0] if v != 0]
+        reduce_sizes = [var_ranges[v] for v in args[1] if v != 0]
 
-        def simplify_and_reorder(x_vars, support_vars, sizes, reordering_reindex=None):
-            sizes, reindex0, reindex1 = self._apply_loop_reordering(
-                x_vars, support_vars, sizes, memory_addrs, reordering_reindex
-            )
-            # for NHWC: reindex0([0,1,2,3]) = [0,2,3,1], reindex1([0,1,2,3]) = [0,3,2,1]
-            x_vars = reindex0(x_vars)
-            sizes, reindex2, prune = V.graph.sizevars._simplify_loops(
-                x_vars,
-                sizes,
-                index_prevent_reordering(index_formulas, x_vars, sizes),
-            )
-            x_vars = prune(x_vars)
-            # sizes, reindex1, prune = _simplify_loops(x_vars, sizes, index_formulas)
-            # x_vars = prune(x_vars)
-            # sizes, reindex2 = self._apply_loop_reordering(x_vars, sizes, memory_addrs)
-            reindex = fuse_reindexing(reindex1, reindex2)
-            return sizes, reindex, reindex1
+        if config.split_var_ranges:
+            splits = body.split_var_ranges()
+            if splits:
+                assert len(splits) == len(iter_sizes) + len(reduce_sizes)
+                k = len(iter_sizes)
+                iter_sizes = [*itertools.chain.from_iterable(splits[:k])]
+                reduce_sizes = [*itertools.chain.from_iterable(splits[k:])]
 
-        support_vars = index_vars + reduce_vars
-        iter_ranges, iter_reindex, iter_reordering_reindex = simplify_and_reorder(
-            index_vars, support_vars, index_size, reordering_reindex
-        )
-        reduce_ranges, reduce_reindex, _ = simplify_and_reorder(
-            reduce_vars, support_vars, reduce_size
-        )
-
-        # remember the reordering if not have loop collapse.
-        if len(iter_ranges) == len(index_vars):
-            self.iter_reordering_reindex = iter_reordering_reindex
-        # retrace the loop body with simplification and reordering applied
-        (iter_vars, reduce_vars), var_ranges = dependencies.index_vars_no_squeeze(
-            iter_ranges, reduce_ranges, prefix="z"
-        )
-        body = LoopBody(
-            body, [iter_reindex(iter_vars), reduce_reindex(reduce_vars)], var_ranges
-        )
-        return (iter_ranges, reduce_ranges), body
-
-    @staticmethod
-    def _apply_loop_reordering(
-        index_vars,
-        support_vars,
-        sizes,
-        memory_addrs,
-        reordering_reindex=None,
-        priority_idx=None,
-    ):
-        """
-        Shuffle the order of loops around to hopefully improve performance.
-        """
-        from .scheduler import pick_loop_order
-
-        if priority_idx is None:
-            priority_idx = []
-
-        try:
-            strides = [
-                V.graph.sizevars.stride_hints(expr, index_vars, support_vars)
-                for expr in memory_addrs
-            ]
-            assert len(strides) == len(memory_addrs) and len(strides[0]) == len(
-                index_vars
-            )
-            # consider both layout(strides) and reordering(reordering_reindex)
-            if reordering_reindex is not None:
-                for i in range(len(memory_addrs)):
-                    try:
-                        strides[i] = reordering_reindex[i](strides[i])
-                    # if len(order) != len(strides), do not reorder
-                    except AssertionError:
-                        pass
-            order = list(reversed(pick_loop_order(strides, sizes, priority_idx)))
-        except Exception:
-            if config.debug:
-                log.warning(
-                    "Did not simplify complex index:\n%s\n%s",
-                    dict(zip(index_vars, sizes)),
-                    memory_addrs,
-                )
-            order = list(range(len(sizes)))
-        sizes = [sizes[i] for i in order]
-        return sizes, same_reorder(order), inverse_reorder(order)
+        return ((iter_sizes, reduce_sizes), body)
 
     def get_reduction_size(self):
         return self.data.get_reduction_size()
@@ -2433,7 +2338,7 @@ class TemplateBuffer(Buffer):
     def should_allocate(self):
         return True
 
-    def simplify_and_reorder(self):
+    def get_sizes_and_body(self):
         return (
             (
                 self.get_size(),
@@ -4087,16 +3992,102 @@ class LoopBody:
         self.var_ranges = var_ranges
         self.indexing_exprs = {}
         self.indexing_exprs_name = {}
-        self.reads = []
-        self.writes = []
-        self.reads_name2expr = {}
-        self.writes_name2expr = {}
-        self.other = []
         self.submodules = {"get_index": self.get_index}
         self.subblocks = {}
         self.indirect_vars = []
         self.root_block = LoopBodyBlock(self, fn, args)
         self.indexing = None
+
+    def split_var_ranges(self):
+        """
+        After view operations we sometimes have complex indexing formulas like:
+
+            210*((q0//9)) + (q1//42) + 1680*ModularIndexing(q0, 1, 9) +
+                30*ModularIndexing(q1, 1, 7) + 5*ModularIndexing(q1, 7, 6)
+
+        This optimization pass splits the iteration space to simplify them to:
+
+            210*f0 + f2 + 1680*f1 + 30*f4 + 5*f3
+
+        Which creates added fusion opportunities.
+        """
+        self.indexing_exprs_name = None  # only needed at creation time
+        ranges = self.var_ranges
+        var_splits = dict()
+
+        # first pass to detect any cases where we want to split vars up
+        for v in ranges.keys():
+            for index in self.indexing_exprs.values():
+                if isinstance(index, sympy.Add) and index.has(ModularIndexing):
+                    terms = [
+                        match_modular_indexing(t, v) for t in index.args if t.has(v)
+                    ]
+                    divisor_to_term = {
+                        divisor: (scale, modulus) for scale, divisor, modulus in terms
+                    }
+                    matched_sizes = []
+                    wanted_divisor = 1
+                    if (
+                        len(divisor_to_term) > 1
+                        and len(divisor_to_term) == len(terms)
+                        and all(k is not None for k in divisor_to_term.keys())
+                    ):
+                        remaining_numel = ranges[v]
+                        for _ in terms:
+                            if wanted_divisor not in divisor_to_term:
+                                break  # failed match
+                            scale, modulus = divisor_to_term[wanted_divisor]
+                            if modulus is None:
+                                matched_sizes.append(
+                                    V.graph.sizevars.simplify(remaining_numel)
+                                )
+                                wanted_divisor = None
+                            else:
+                                remaining_numel = FloorDiv(remaining_numel, modulus)
+                                matched_sizes.append(modulus)
+                                wanted_divisor = wanted_divisor * modulus
+
+                    if len(matched_sizes) == len(terms) and wanted_divisor is None:
+                        V.graph.sizevars.guard_equals(
+                            ranges[v], sympy_product(matched_sizes)
+                        )
+                        var_splits[v] = [*reversed(matched_sizes)]
+                        break  # move on to next variable
+
+        if not var_splits:
+            return None  # nothing to split
+
+        # build set of replacements to index formulas
+        var_replacements = {}
+        expr_replacements = {}
+        new_var_ranges, add_var = var_builder("f")
+        for old_var, old_size in ranges.items():
+            new_size = var_splits.get(old_var, [old_size])
+            new_vars = [add_var(s) for s in new_size]
+            if len(new_vars) > 1:
+                var_replacements[old_var] = sympy_dot(
+                    new_vars, FlexibleLayout.contiguous_strides(var_splits[old_var])
+                )
+                wanted_divisor = 1
+                for i, v, s in reversed([*zip(itertools.count(), new_vars, new_size)]):
+                    expr_replacements[ModularIndexing(old_var, wanted_divisor, s)] = v
+                    if i == 0:
+                        expr_replacements[FloorDiv(old_var, wanted_divisor)] = v
+                        expr_replacements[CleanDiv(old_var, wanted_divisor)] = v
+                    wanted_divisor = wanted_divisor * s
+            else:
+                var_replacements[old_var] = new_vars[0]
+
+        def replace(expr):
+            if expr.has(ModularIndexing) or expr.has(FloorDiv) or expr.has(CleanDiv):
+                expr = expr.subs(expr_replacements)
+            return sympy_subs(expr, var_replacements)
+
+        self.var_ranges = new_var_ranges
+        self.indexing_exprs = {k: replace(v) for k, v in self.indexing_exprs.items()}
+        return [
+            var_splits.get(old_var, [old_size]) for old_var, old_size in ranges.items()
+        ]
 
     def debug_str(self):
         lines = [f"var_ranges = {dict(self.var_ranges)}"]
@@ -4112,9 +4103,6 @@ class LoopBody:
         return "\n".join(lines)
 
     def add_index_expr(self, expr: sympy.Expr, category, buf_name):
-        getattr(self, category).append(expr)
-        if buf_name is not None:
-            getattr(self, f"{category}_name2expr")[buf_name] = expr
         if expr not in self.indexing_exprs_name:
             name = f"index{len(self.indexing_exprs)}"
             self.indexing_exprs_name[expr] = name
