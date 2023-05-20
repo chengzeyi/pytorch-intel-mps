@@ -1,4 +1,5 @@
 import abc
+import dataclasses
 import enum
 import functools
 import inspect
@@ -15,6 +16,13 @@ from ..exc import unimplemented
 from ..source import AttrSource, ConstantSource, DefaultsSource, GetItemSource
 from ..utils import istensor, istype, make_cell
 from .base import typestr, VariableTracker
+
+
+def is_dataclass_default_factory(obj):
+    return (
+        hasattr(dataclasses, "_HAS_DEFAULT_FACTORY")
+        and obj is dataclasses._HAS_DEFAULT_FACTORY
+    )
 
 
 def wrap_bound_arg(tx, val, options, source=None):
@@ -54,15 +62,17 @@ def wrap_bound_arg(tx, val, options, source=None):
         return variables.UserFunctionVariable(val, source=source, **options)
     elif isinstance(val, enum.Enum):
         return variables.EnumVariable(val, source=source, **options)
-    elif isinstance(val, (type, abc.ABCMeta)):
+    elif isinstance(val, (type, abc.ABCMeta)) or is_dataclass_default_factory(val):
         return variables.UserDefinedClassVariable(val, source=source, **options)
     elif istensor(val):
         from torch._dynamo.variables.builder import VariableBuilder
 
         return VariableBuilder(tx, source=source, **options)(val)
-    else:
-        assert isinstance(val, VariableTracker), typestr(val)
+    elif isinstance(val, VariableTracker):
         return val
+    else:
+        # Don't cause Dynamo to crash on unimplemented binding, and cause a graph break
+        unimplemented("bind_arg failed")
 
 
 def wrap_args_kwargs(tx, result, options):
