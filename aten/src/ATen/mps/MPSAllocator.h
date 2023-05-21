@@ -240,7 +240,7 @@ public:
     m_small_pool_shared (m_device, UsageFlags::SMALL   | UsageFlags::SHARED  | UsageFlags::HAZARD),
     m_small_pool_private(m_device, UsageFlags::SMALL   | UsageFlags::PRIVATE | UsageFlags::HAZARD),
     // no Hazard Tracking required for the Scalar pool (synchronized manually)
-    m_scalar_pool(m_device, UsageFlags::SMALL | UsageFlags::SHARED | UsageFlags::SCALAR),
+    m_scalar_pool(m_device, UsageFlags::SMALL | UsageFlags::PRIVATE | UsageFlags::SCALAR),
     m_total_allocated_memory(0), m_current_allocated_memory(0),
     m_max_buffer_size([m_device maxBufferLength]), m_stream(getDefaultMPSStream())
   {
