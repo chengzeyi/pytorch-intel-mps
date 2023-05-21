@@ -33,6 +33,7 @@ export PYTORCH_BUILD_VERSION=2.0.0 PYTORCH_BUILD_NUMBER=1
 MACOSX_DEPLOYMENT_TARGET=10.15 MAX_JOBS=8 USE_FBGEMM=0 BUILD_CUSTOM_PROTOBUF=OFF python setup.py develop
 
 # Install from GitHub release
+pip install 'torch @ https://github.com/chengzeyi/pytorch-intel-mps/releases/download/v2.0.0-intel-mps/torch-2.0.0-cp310-cp310-macosx_10_15_x86_64.whl'
 ```
 
 ### Test
