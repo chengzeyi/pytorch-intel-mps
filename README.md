@@ -25,12 +25,12 @@ By leveraging Intel integrated graphics, this modified version of PyTorch enable
 ### Installation
 
 ```bash
-# Build from source
+# Install from source
+git submodule update --init --recursive
 export CMAKE_PREFIX_PATH=${CONDA_PREFIX:-"$(dirname $(which conda))/../"}
-
 export PYTORCH_BUILD_VERSION=2.0.0 PYTORCH_BUILD_NUMBER=1
-
-MACOSX_DEPLOYMENT_TARGET=10.15 MAX_JOBS=8 USE_FBGEMM=0 BUILD_CUSTOM_PROTOBUF=OFF python setup.py develop
+MACOSX_DEPLOYMENT_TARGET=10.15 MAX_JOBS=8 USE_FBGEMM=0 BUILD_CUSTOM_PROTOBUF=OFF \
+    python setup.py install
 
 # Install from GitHub release
 pip install 'torch @ https://github.com/chengzeyi/pytorch-intel-mps/releases/download/v2.0.0-intel-mps/torch-2.0.0-cp310-cp310-macosx_10_15_x86_64.whl'
@@ -38,7 +38,7 @@ pip install 'torch @ https://github.com/chengzeyi/pytorch-intel-mps/releases/dow
 
 ### Test
 
-Run the following Python Code
+Run the following Python code
 
 ```python3
 # Check that MPS is available
@@ -74,7 +74,8 @@ else:
 
 ```bash
 # Must set PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to avoid OOM
-PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 python -m fastchat.serve.cli --model-path /path/to/model/weights --device mps --load-8bit
+PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 \
+    python -m fastchat.serve.cli --model-path /path/to/model/weights --device mps --load-8bit
 
 # Thouth relatively faster than with pure CPU,
 # it is still slower than M1/M2.
