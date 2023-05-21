@@ -1,3 +1,86 @@
+# About This Package
+
+## Brief Summary
+This package is a modified version of PyTorch that supports the use of MPS backend with Intel Graphics Card (UHD or Iris) on Intel Mac or MacBook without a discrete graphics card.
+
+Previously, the standard PyTorch package can only utilize the GPU on M1/M2 MacBook or Intel MacBook with an AMD video card.
+
+With this package, it is possible to run LLaMA or Stable Diffusion directly on a plain old Intel MacBook with GPU acceleration with a reasonable speed.
+
+Building PyTorch is a little complicated and slow so I have released a pre-built package for **Python 3.10**, the latest Python version that supports `torch.compile`.
+
+## Introduction
+
+### Introducing PyTorch with Intel Integrated Graphics Support on Mac or MacBook: Empowering Personal Enthusiasts
+
+I am excited to introduce my modified version of PyTorch that includes support for Intel integrated graphics. This modification was developed to address the needs of individual enthusiasts like myself, who own Intel-powered MacBooks without a discrete graphics card and seek to run popular large language models despite limited hardware capabilities.
+
+Previously, running large models or compute-intensive tasks that relied on PyTorch's Metal Performance Shaders (MPS) backend was impossible for MacBook users without dedicated graphics cards. But in fact, it is theoretically possible according to this post [
+PyTorch support for Intel GPUs on Mac](https://discuss.pytorch.org/t/pytorch-support-for-intel-gpus-on-mac/151996/7). However, it is disabled for some reason and there is no official release for it so I decide to build one.
+
+By leveraging Intel integrated graphics, this modified version of PyTorch enables you to tap into the full potential of your Intel MacBook, even without a dedicated GPU. Now, you can seamlessly run state-of-the-art generative models and handle compute-intensive workloads, expanding the possibilities of what your hardware can achieve.
+
+## Usage
+
+### Installation
+
+```bash
+# Build from source
+export CMAKE_PREFIX_PATH=${CONDA_PREFIX:-"$(dirname $(which conda))/../"}
+
+export PYTORCH_BUILD_VERSION=2.0.0 PYTORCH_BUILD_NUMBER=1
+
+MACOSX_DEPLOYMENT_TARGET=10.15 MAX_JOBS=8 USE_FBGEMM=0 BUILD_CUSTOM_PROTOBUF=OFF python setup.py develop
+
+# Install from GitHub release
+```
+
+### Test
+
+Run the following Python Code
+
+```python3
+# Check that MPS is available
+if not torch.backends.mps.is_available():
+    if not torch.backends.mps.is_built():
+        print("MPS not available because the current PyTorch install was not "
+              "built with MPS enabled.")
+    else:
+        print("MPS not available because the current MacOS version is not 12.3+ "
+              "and/or you do not have an MPS-enabled device on this machine.")
+
+else:
+    mps_device = torch.device("mps")
+
+    # Create a Tensor directly on the mps device
+    x = torch.ones(5, device=mps_device)
+    # Or
+    x = torch.ones(5, device="mps")
+
+    # Any operation happens on the GPU
+    y = x * 2
+
+    # Move your model to mps just like any other device
+    model = torch.nn.ReLU()
+    model.to(mps_device)
+
+    # Now every call runs on the GPU
+    pred = model(x)
+    print("MPS runs successfully")
+```
+
+### Run FastChat
+
+```bash
+# Must set PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to avoid OOM
+PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 python -m fastchat.serve.cli --model-path /path/to/model/weights --device mps --load-8bit
+
+# Thouth relatively faster than with pure CPU,
+# it is still slower than M1/M2.
+# You may have to wait for a while
+# for it to begin to respond to your prompt.
+```
+
 ![PyTorch Logo](https://github.com/pytorch/pytorch/blob/master/docs/source/_static/img/pytorch-logo-dark.png)
 
 --------------------------------------------------------------------------------
